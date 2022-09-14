@@ -1,0 +1,398 @@
+package gos7
+
+// Copyright 2018 Trung Hieu Le. All rights reserved.
+// This software may be modified and distributed under the terms
+// of the BSD license. See the LICENSE file for details.
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+	"time"
+)
+
+const (
+	// Area ID
+	s7areape = 0x81 //process inputs  I
+	s7areapa = 0x82 //process outputs Q
+	s7areamk = 0x83 //Merkers flags   M
+	s7areadb = 0x84 //DB      db      DB  V=DB1.xxx.1
+	s7areadi = 0x85 //DI      DI I区
+	s7arealc = 0x86 //LOCAL   LOCAL
+	s7areav  = 0x87 //IEC timers (200 family)
+
+	s7areact    = 0x1C //counters
+	s7areact200 = 0x1E //counters
+	s7areatm    = 0x1D //timers
+
+	// Word Length
+	s7wlbit     = 0x01 //Bit (inside a word)
+	s7wlbyte    = 0x02 //Byte (8 bit)
+	s7wlChar    = 0x03
+	s7wlword    = 0x04 //Word (16 bit)
+	s7wlint     = 0x05
+	s7wldword   = 0x06 //Double Word (32 bit)
+	s7wldint    = 0x07
+	s7wlreal    = 0x08 //Real (32 bit float)
+	s7wlcounter = 0x1C //Counter (16 bit)
+	s7wltimer   = 0x1D //Timer (16 bit)
+	// PLC Status
+	s7CpuStatusUnknown = 0
+	s7CpuStatusRun     = 8
+	s7CpuStatusStop    = 4
+	//size header
+	sizeHeaderRead  int = 31 // Header Size when Reading
+	sizeHeaderWrite int = 35 // Header Size when Writing
+	// Result transport size
+	tsResBit   = 3
+	tsResByte  = 4
+	tsResInt   = 5
+	tsResReal  = 7
+	tsResOctet = 9
+)
+
+//PDULength variable to store pdu length after connect
+//var tt, _ := mb.handler.(*tcpTransporter)tt, _ := mb.handler.(*tcpTransporter) int //global variable pdulength
+
+// CliePDULengthntHandler is the interface that groups the Packager and Transporter methods.
+type Client struct {
+	handler *TCPClientHandler
+}
+
+// NewClient creates a new s7 Client with given backend handler.
+func NewClient(address string, rack, slot int) (*Client, error) {
+	handler := NewTCPClientHandler(address, rack, slot)
+	handler.Timeout = 10 * time.Second
+	handler.IdleTimeout = 200 * time.Second
+	//	handler.Logger = log.New(os.Stdout, "tcp: ", log.LstdFlags)
+	tcpErr := handler.Connect()
+	if tcpErr != nil {
+		return nil, tcpErr
+	}
+	return &Client{handler: handler}, nil
+}
+
+//read generic area, pass result into a buffer
+func (c *Client) readArea(area int, dbNumber int, start int, amount int, wordLen int, buffer []byte) (err error) {
+
+	var address, numElements, maxElements, totElements, sizeRequested int
+	offset := 0
+	wordSize := 1
+	// Some adjustment
+	if area == s7areact {
+		wordLen = s7wlcounter
+	}
+	if area == s7areatm {
+		wordLen = s7wltimer
+	}
+	// Calc Word size
+	wordSize = dataSizeByte(wordLen)
+	if wordSize == 0 {
+		return fmt.Errorf(ErrorText(errIsoInvalidDataSize))
+	}
+	if wordLen == s7wlbit {
+		amount = 1 // Only 1 bit can be transferred at time
+	} else {
+		if wordLen != s7wlcounter && wordLen != s7wltimer {
+			amount = amount * wordSize
+			wordSize = 1
+			wordLen = s7wlbyte
+		}
+	}
+	tt, _ := interface{}(c.handler).(*TCPClientHandler)
+	maxElements = (tt.PDULength - 18) / wordSize // 18 = Reply telegram header //lth note here
+	totElements = amount
+	for totElements > 0 && err == nil {
+		numElements = totElements
+		if numElements > maxElements {
+			numElements = maxElements
+		}
+		sizeRequested = numElements * wordSize
+		// Setup the telegram
+		requestData := make([]byte, sizeHeaderRead)
+		copy(requestData[0:], s7ReadWriteTelegram[0:])
+		request := NewProtocolDataUnit(requestData)
+		// Set DB Number
+		request.Data[27] = byte(area)
+		// Set Area
+		if area == s7areadb {
+			binary.BigEndian.PutUint16(request.Data[25:], uint16(dbNumber))
+			//SetWordAt(request.Data, 25, uint16(DBNumber))
+		}
+		// log.Println("area", area, dbNumber, start, amount, wordLen)
+		// Adjusts Start and word length
+		if wordLen == s7wlbit || wordLen == s7wlcounter || wordLen == s7wltimer {
+			address = start
+			request.Data[22] = byte(wordLen)
+		} else {
+			address = start << 3
+		}
+		// Num elements
+		binary.BigEndian.PutUint16(request.Data[23:], uint16(numElements))
+		//SetWordAt(request.Data, 23, uint16(numElements))
+		// Address into the PLC (only 3 bytes)
+		request.Data[30] = byte(address & 0x0FF)
+		address = address >> 8
+		request.Data[29] = byte(address & 0x0FF)
+		address = address >> 8
+		request.Data[28] = byte(address & 0x0FF)
+		var response *ProtocolDataUnit
+		response, sendError := c.send(&request)
+		err = sendError
+
+		if err == nil {
+			if size := len(response.Data); size < 25 {
+				err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", len(response.Data))
+			} else {
+				if response.Data[21] != 0xFF {
+					err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
+				} else {
+					//copy response to buffer
+					copy(buffer[offset:offset+sizeRequested], response.Data[25:25+sizeRequested])
+					offset += sizeRequested
+				}
+			}
+		}
+		totElements -= numElements
+		start += numElements * wordSize
+	}
+	return
+}
+
+//writeArea write generic area into PLC with following parameters:
+//1.area: s7areape/s7areapa/s7areamk/s7areadb/s7areact/s7areatm
+//2.dbnumber: specify dbnumber, to use in write DB area, otherwise = 0
+//3.start: start of the address
+//4.amount: amount of the address
+//5.wordlen: bit/byte/word/dword/real/counter/timer
+//6.buffer: a byte array input for writing
+func (c *Client) writeArea(area int, dbnumber int, start int, amount int, wordlen int, buffer []byte) (err error) {
+	var address, numElements, maxElements, totElements, dataSize, isoSize, length int
+	offset := 0
+	wordSize := 1
+
+	// Some adjustment
+	if area == s7areact {
+		wordlen = s7wlcounter
+	}
+	if area == s7areatm {
+		wordlen = s7wltimer
+	}
+
+	// Calc Word size
+	wordSize = dataSizeByte(wordlen)
+	if wordSize == 0 {
+		return fmt.Errorf(ErrorText(errIsoInvalidDataSize))
+	}
+
+	if wordlen == s7wlbit {
+		amount = 1 // Only 1 bit can be transferred at time
+	} else {
+		if wordlen != s7wlcounter && wordlen != s7wltimer {
+			amount = amount * wordSize
+			wordSize = 1
+			wordlen = s7wlbyte
+		}
+	}
+	tt, _ := interface{}(c.handler).(*TCPClientHandler)
+	maxElements = (tt.PDULength - 35) / wordSize // 35 = Reply telegram header
+	totElements = amount
+	for totElements > 0 && err == nil {
+		numElements = totElements
+		if numElements > maxElements {
+			numElements = maxElements
+		}
+		dataSize = numElements * wordSize
+		isoSize = sizeHeaderWrite + dataSize
+
+		// Setup the telegram
+		requestData := make([]byte, sizeHeaderWrite)
+		copy(requestData[0:], s7ReadWriteTelegram[0:])
+
+		request := NewProtocolDataUnit(requestData)
+		// Whole telegram Size
+		binary.BigEndian.PutUint16(request.Data[2:], uint16(isoSize))
+		//SetWordAt(request.Data, 2, uint16(isoSize))
+		// Data length
+		length = dataSize + 4
+		binary.BigEndian.PutUint16(request.Data[15:], uint16(length))
+		// SetWordAt(request.Data, 15, uint16(length))
+		// Function
+		request.Data[17] = byte(0x05)
+		// Set DB Number
+		request.Data[27] = byte(area)
+		if area == s7areadb {
+			binary.BigEndian.PutUint16(request.Data[25:], uint16(dbnumber))
+			//SetWordAt(request.Data, 25, uint16(dbnumber))
+		}
+		// Adjusts start and word length
+		if wordlen == s7wlbit || wordlen == s7wlcounter || wordlen == s7wltimer {
+			address = start
+			length = dataSize
+			request.Data[22] = byte(wordlen)
+		} else {
+			address = start << 3
+			length = dataSize << 3
+		}
+
+		// Num elements
+		binary.BigEndian.PutUint16(request.Data[23:], uint16(numElements))
+		// SetWordAt(request.Data, 23, uint16(numElements))
+		// address into the PLC
+		request.Data[30] = byte(address & 0x0FF)
+		address = address >> 8
+		request.Data[29] = byte(address & 0x0FF)
+		address = address >> 8
+		request.Data[28] = byte(address & 0x0FF)
+
+		// Transport Size
+		switch wordlen {
+		case s7wlbit:
+			request.Data[32] = tsResBit
+			break
+		case s7wlcounter:
+		case s7wltimer:
+			request.Data[32] = tsResOctet
+			break
+		default:
+			request.Data[32] = tsResByte // byte/word/dword etc.
+			break
+		}
+		// length
+		// SetWordAt(request.Data, 33, uint16(length))
+		binary.BigEndian.PutUint16(request.Data[33:], uint16(length))
+
+		//expand values into array
+		request.Data = append(request.Data[:35], append(buffer[offset:offset+dataSize], request.Data[35:]...)...)
+		response, sendError := c.send(&request)
+		err = sendError
+		if err == nil {
+			if length = len(response.Data); length == 22 {
+				if response.Data[21] != byte(0xFF) {
+					err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
+				}
+			} else {
+				err = fmt.Errorf(ErrorText(errIsoInvalidPDU))
+			}
+
+		}
+		offset += dataSize
+		totElements -= numElements
+		start += numElements * wordSize
+	}
+	return
+}
+
+//send the package of a pdu request and a pdu response, check for response error and verify the package
+func (c *Client) send(request *ProtocolDataUnit) (response *ProtocolDataUnit, err error) {
+	dataResponse, err := c.handler.Send(request.Data)
+	if dataResponse == nil || len(dataResponse) == 0 {
+		// Empty response
+		err = fmt.Errorf("s7: response data is empty")
+		return
+	}
+	response = &ProtocolDataUnit{
+		Data: dataResponse,
+	}
+	//check for error if any
+	err = responseError(response)
+	return response, err
+}
+
+//responseError get response error from pdu return S7Error with high and low byte
+func responseError(response *ProtocolDataUnit) error {
+	s7Error := &S7Error{}
+	if response.Data != nil && len(response.Data) > 0 {
+		switch int(response.Data[1]) {
+		case 1:
+		case 7:
+			s7Error.High = response.Data[2]
+			s7Error.Low = response.Data[3]
+			break
+		case 2:
+		case 3:
+			s7Error.High = response.Data[10]
+			s7Error.Low = response.Data[11]
+			break
+		default:
+			return nil
+		}
+	}
+	return s7Error
+}
+
+//dataSize to number of byte accordingly
+func dataSizeByte(wordLength int) int {
+	switch wordLength {
+	case s7wlbit:
+		return 1
+	case s7wlbyte:
+		return 1
+	case s7wlChar:
+		return 1
+	case s7wlword:
+		return 2
+	case s7wlint:
+		return 2
+	case s7wlcounter:
+		return 2
+	case s7wltimer:
+		return 2
+	case s7wldword:
+		return 4
+	case s7wldint:
+		return 4
+	case s7wlreal:
+		return 4
+	default:
+		return 0
+	}
+
+}
+
+func (c *Client) AGReadDB(dbNumber int, start int, size int) (*DataReader, error) {
+	sizeLen := int(math.Ceil(float64(size)/4) * 4)
+	buffer := make([]byte, sizeLen)
+	err := c.readArea(s7areadb, dbNumber, start, size, s7wlbyte, buffer)
+	if err != nil {
+		return nil, err
+	}
+	return NewDataReader(buffer), nil
+}
+
+func (c *Client) AGReadQ(start int, size int) (*DataReader, error) {
+	sizeLen := int(math.Ceil(float64(size)/4) * 4)
+	buffer := make([]byte, sizeLen)
+	err := c.readArea(s7areapa, 0, start, size, s7wlbyte, buffer)
+	if err != nil {
+		return nil, err
+	}
+	return NewDataReader(buffer), nil
+}
+
+func (c *Client) AGReadI(start int, size int) (*DataReader, error) {
+	sizeLen := int(math.Ceil(float64(size)/4) * 4)
+	buffer := make([]byte, sizeLen)
+	err := c.readArea(s7areape, 0, start, size, s7wlbyte, buffer)
+	if err != nil {
+		return nil, err
+	}
+	return NewDataReader(buffer), nil
+}
+
+func (c *Client) AGReadM(start int, size int) (*DataReader, error) {
+	sizeLen := int(math.Ceil(float64(size)/4) * 4)
+	buffer := make([]byte, sizeLen)
+	err := c.readArea(s7areamk, 0, start, size, s7wlbyte, buffer)
+	if err != nil {
+		return nil, err
+	}
+	return NewDataReader(buffer), nil
+}
+
+func (c *Client) AGReadV(start int, size int) (*DataReader, error) {
+	return c.AGReadDB(1, start, size)
+}
+
+func (c *Client) Close() error {
+	return c.handler.Close()
+}
